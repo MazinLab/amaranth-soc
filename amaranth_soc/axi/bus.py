@@ -20,14 +20,13 @@ __all__ = [
 
 class BurstType(enum.Enum):
     """AXI Burst Types"""
-
     FIXED = 0b00
-    INCR = 0b01
-    WRAP = 0b10
+    INCR  = 0b01
+    WRAP  = 0b10
 
 
 class RespType(enum.Enum):
-    OKAY = 0b00
+    OKAY   = 0b00
     EXOKAY = 0b01
     SLVERR = 0b10
     DECERR = 0b11
@@ -39,6 +38,7 @@ class LockType(enum.Enum):
 
 
 # TODO: Should we strict to spec compliant feature sets, ie !last => !lock, etc
+# TODO: USER Signalling???
 class Feature(enum.Enum):
     """Optional Wishbone interface signals."""
     LAST    = "last"
@@ -49,6 +49,8 @@ class Feature(enum.Enum):
     QOS     = "qos"
     ID      = "id"
 
+AXI4 = frozenset((Feature.LAST,))
+AXI4LITE = frozenset()
 
 class Signature(wiring.Signature):
     """AXI4 interface signals.
@@ -74,9 +76,10 @@ class Signature(wiring.Signature):
             raise TypeError(
                 f"Address width must be a non-negative integer, not {addr_width!r}"
             )
+        # TODO: Strictly speaking I believe the minimum width is 32
         if data_width not in (8, 16, 32, 64, 128, 256, 512, 1024, 2048):
             raise ValueError(
-                f"Data width must be one of 8, 16, 32, 64, 128, 256, 512, 2048, not {data_width!r}"
+                f"Data width must be one of 8, 16, 32, 64, 128, 256, 512, 1024, 2048, not {data_width!r}"
             )
         for feature in features:
             Feature(feature)  # raises ValueError if feature is invalid
@@ -89,6 +92,10 @@ class Signature(wiring.Signature):
         if Feature.ID in features and (not isinstance(id_width, int) or id_width <= 0):
             raise TypeError(
                 f"ID width must be an integer larger than zero if the ID feature is enabled, not {id_width!r}"
+            )
+        if Feature.LAST not in features and Feature.BURST in features:
+            raise TypeError(
+                "BURST feature implies LAST feature"
             )
 
         self._addr_width = addr_width
@@ -264,7 +271,7 @@ class Interface(wiring.PureInterface):
         *,
         addr_width,
         data_width,
-        id_width,
+        id_width=None,
         features=frozenset(),
         path=None,
         src_loc_at=0,
@@ -330,7 +337,7 @@ class Interface(wiring.PureInterface):
         self._memory_map = memory_map
 
     def __repr__(self):
-        return f"wishbone.Interface({self.signature!r})"
+        return f"axi.Interface({self.signature!r})"
 
 
 class Decoder(wiring.Component):
@@ -362,9 +369,9 @@ class Decoder(wiring.Component):
         *,
         addr_width,
         data_width,
-        id_width,
+        id_width=None,
         features=frozenset(),
-        alignment=0,
+        alignment=exact_log2(4096),
         name=None,
     ):
         super().__init__(
@@ -413,7 +420,7 @@ class Decoder(wiring.Component):
             sub_bus_unflipped = sub_bus
         if not isinstance(sub_bus_unflipped, Interface):
             raise TypeError(
-                f"Subordinate bus must be an instance of wishbone.Interface, not "
+                f"Subordinate bus must be an instance of axi.Interface, not "
                 f"{sub_bus_unflipped!r}"
             )
         # TODO: Check is redundant for to-spec axi buses
@@ -470,7 +477,6 @@ class Decoder(wiring.Component):
 
                 sub_bus.wdata.eq(self.bus.wdata),
                 sub_bus.wstrb.eq(self.bus.wstrb),
-                sub_bus.wlast.eq(self.bus.wlast),
 
                 sub_bus.araddr.eq(self.bus.araddr << exact_log2(sub_ratio)),
                 sub_bus.arprot.eq(self.bus.arprot),
@@ -479,15 +485,9 @@ class Decoder(wiring.Component):
             # TODO: Where the spec specified default is zeros should I drop the explicit set
             if Feature.LAST in sub_bus.features:
                 if Feature.LAST in self.bus.features:
-                    m.d.comb += [
-                        sub_bus.wlast.eq(self.bus.wlast),
-                        sub_bus.rlast.eq(self.bus.rlast),
-                    ]
+                    m.d.comb += sub_bus.wlast.eq(self.bus.wlast)
                 else:
-                    m.d.comb += [
-                        sub_bus.wlast.eq(1),
-                        sub_bus.rlast.eq(1),
-                    ]
+                    m.d.comb += sub_bus.wlast.eq(1)
             if Feature.BURST in sub_bus.features:
                 if Feature.BURST in self.bus.features:
                     m.d.comb += [
@@ -566,6 +566,106 @@ class Decoder(wiring.Component):
                         sub_bus.awid.eq(0),
                         sub_bus.bid.eq(0),
                     ]
+
+        write_hot = Signal(len(bus_list))
+        w_need_address, wna = Signal(), Signal()
+        w_need_data, wnd = Signal(), Signal()
+        w_need_resp, wnr = Signal(), Signal()
+
+
+        read_hot = Signal(len(bus_list))
+        r_need_address, rna = Signal(), Signal()
+        r_need_data, rnd = Signal(), Signal()
+
+        m.d.comb += [
+            wna.eq(w_need_address),
+            wnd.eq(w_need_data),
+            wnr.eq(w_need_resp),
+
+            rna.eq(r_need_address),
+            rnd.eq(r_need_data),
+        ]
+
+        m.d.sync += Assert(sum([i for i in write_hot]) <= 1)
+        m.d.sync += Assert(sum([i for i in read_hot]) <= 1)
+
+        # TODO: This implementation does not support pipelined transactions
+        # TODO: ID Reflection, or maybe don't and make an adapter required as it would complicate future pipelining
+        granularity_bits = exact_log2(self.bus.data_width // self.bus.granularity)
+        for i, (sub_map, sub_pat, sub_ratio) in enumerate(bus_list):
+            sub_bus = self._subs[sub_map]
+            with m.If(write_hot[i] | (~write_hot.any() & self.bus.awvalid & self.bus.awaddr.matches(sub_pat[:-granularity_bits if granularity_bits > 0 else None]))):
+                with m.If(~write_hot.any()):
+                    m.d.comb += [
+                        wna.eq(1),
+                        wnd.eq(1),
+                        wnr.eq(1),
+                    ]
+
+                with m.If(wna):
+                    m.d.comb += [
+                        sub_bus.awvalid.eq(self.bus.awvalid),
+                        self.bus.awready.eq(sub_bus.awready),
+                        wna.eq(~(self.bus.awvalid & sub_bus.awready))
+                    ]
+                with m.If(wnd):
+                    m.d.comb += [
+                        sub_bus.wvalid.eq(self.bus.wvalid),
+                        self.bus.wready.eq(sub_bus.wready),
+                        wnd.eq(~(self.bus.wvalid & sub_bus.wready & (self.bus.wlast if Feature.LAST in self.bus.features else 1)))
+                    ]
+                with m.If(wnr):
+                    m.d.comb += [
+                        self.bus.bvalid.eq(sub_bus.bvalid),
+                        self.bus.bresp.eq(sub_bus.bresp),
+                        sub_bus.bready.eq(self.bus.bready),
+                        wnr.eq(~(self.bus.bready & sub_bus.bvalid)),
+                    ]
+
+                m.d.sync += [
+                    w_need_address.eq(wna),
+                    w_need_data.eq(wnd),
+                    w_need_resp.eq(wnr),
+                ]
+
+                with m.If(wna | wnd | wnr == 0):
+                    m.d.sync += write_hot.eq(0)
+                with m.Else():
+                    m.d.sync += write_hot.eq(1 << i)
+
+            with m.If(read_hot[i] | (~read_hot.any() & self.bus.arvalid & self.bus.araddr.matches(sub_pat[:-granularity_bits if granularity_bits > 0 else None]))):
+                with m.If(~read_hot.any()):
+                    m.d.comb += [
+                        rna.eq(1),
+                        rnd.eq(1)
+                    ]
+
+                with m.If(rna):
+                    m.d.comb += [
+                        sub_bus.arvalid.eq(self.bus.arvalid),
+                        self.bus.arready.eq(sub_bus.arready),
+                        rna.eq(~(self.bus.arvalid & sub_bus.arready))
+                    ]
+                with m.If(rnd):
+                    m.d.comb += [
+                        sub_bus.rready.eq(self.bus.rready),
+                        self.bus.rresp.eq(sub_bus.rresp),
+                        self.bus.rdata.eq(sub_bus.rdata),
+                        self.bus.rvalid.eq(sub_bus.rvalid),
+                        rnd.eq(~(self.bus.rready & sub_bus.rvalid & (sub_bus.rlast if Feature.LAST in self.bus.features else 1)))
+                    ]
+                    if Feature.LAST in self.bus.features:
+                        m.d.comb += self.bus.rlast.eq(sub_bus.rlast)
+
+                m.d.sync += [
+                    r_need_address.eq(rna),
+                    r_need_data.eq(rnd),
+                ]
+
+                with m.If(rna | rnd == 0):
+                    m.d.sync += read_hot.eq(0)
+                with m.Else():
+                    m.d.sync += read_hot.eq(1 << i)
 
         return m
 
